@@ -30,6 +30,13 @@ export default function EditorPage() {
   const [speakingFocus, setSpeakingFocus] = useState(null) // {range,speakers}
   const [turnFocus, setTurnFocus] = useState(null) // {range,from,to,kind}
   const [coverageFocus, setCoverageFocus] = useState(null) // {range}
+  // Monotonic counter bumped by every local draft edit (name, segments,
+  // annotations, import).  A save snapshots the counter when it starts and
+  // compares again when the response arrives, so the success callback only
+  // confirms the exact snapshot the request submitted: edits made while the
+  // request is in flight keep the draft dirty instead of being falsely
+  // reported as saved.
+  const editSeqRef = useRef(0)
   const importRef = useRef(null)
   const timelineRef = useRef(null)
 
@@ -142,27 +149,55 @@ export default function EditorPage() {
       { behavior: 'smooth', block: 'center' }), 0)
   }
 
-  const update = (patch) => {
-    setDoc((d) => ({ ...d, ...patch }))
+  // Register a local draft edit: bump the sequence used to detect edits
+  // made while a save request is in flight, and mark the draft unsaved.
+  const markEdited = () => {
+    editSeqRef.current += 1
     setDirty(true)
   }
 
+  const update = (patch) => {
+    setDoc((d) => ({ ...d, ...patch }))
+    markEdited()
+  }
+
   const save = useCallback(async () => {
+    // Freeze the snapshot this request submits; the counter below lets the
+    // async callback tell whether the user kept editing during the request.
+    const seqAtSave = editSeqRef.current
+    const snapshotName = name.trim()
+    const snapshotDoc = doc
+    const snapshotVersion = project?.documentVersion
     setSaving(true); setError('')
     try {
       const p = await api.saveProject(id, {
-        name: name.trim(), document: doc,
-        documentVersion: project?.documentVersion,
+        name: snapshotName, document: snapshotDoc,
+        documentVersion: snapshotVersion,
       })
-      setProject(p)
-      setDirty(false)
-      setConflict(false)
-      setMessage('已保存 ' + new Date().toLocaleTimeString())
+      if (editSeqRef.current === seqAtSave) {
+        // No edits since the request started: the response fully matches the
+        // draft on screen, so the unsaved state can be cleared.
+        setProject(p)
+        setDirty(false)
+        setConflict(false)
+        setMessage('已保存 ' + new Date().toLocaleTimeString())
+      } else {
+        // The user edited again while the request was in flight.  The server
+        // only confirmed the submitted snapshot (now the saved baseline);
+        // adopt the response's version so the newer draft can be saved, but
+        // keep the current draft (doc/name states) on screen and the 未保存
+        // marker visible.
+        setProject(p)
+        setDirty(true)
+        setConflict(false)
+        setMessage('此前的修改已保存；保存期间又有新的编辑，仍标记为未保存')
+      }
       setTimeout(() => setMessage(''), 2500)
     } catch (e) {
+      // Failed / stale (409) saves write nothing: keep the draft on screen.
+      // A 409 additionally blocks saving until the user actively reloads the
+      // latest project.
       if (e.status === 409) {
-        // Another page saved first: keep the unsaved draft on screen and
-        // block further saves until the user reloads the latest project.
         setConflict(true)
       } else {
         setError(e.message)
@@ -273,7 +308,7 @@ export default function EditorPage() {
       const p = await api.importIntoProject(id, fd)
       setDoc(p.document)
       setProject(p)
-      setDirty(true)
+      markEdited()
     } catch (e) {
       setError(`导入失败：${e.message}`)
     } finally {
@@ -305,7 +340,7 @@ export default function EditorPage() {
           <input
             className="project-name"
             value={name}
-            onChange={(e) => { setName(e.target.value); setDirty(true) }}
+            onChange={(e) => { setName(e.target.value); markEdited() }}
           />
           {dirty && <span className="badge warn">未保存</span>}
         </div>
