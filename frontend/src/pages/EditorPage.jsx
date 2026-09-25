@@ -32,6 +32,11 @@ export default function EditorPage() {
   const [coverageFocus, setCoverageFocus] = useState(null) // {range}
   const importRef = useRef(null)
   const timelineRef = useRef(null)
+  // Bumped on every local edit (name, segments, annotations, import).  A save
+  // captures its value at click time; if it has advanced by the time the
+  // response arrives, the response only confirms the submitted snapshot and
+  // the newer draft must stay marked unsaved.
+  const editSeqRef = useRef(0)
 
   useEffect(() => {
     api.getProject(id).then((p) => {
@@ -145,9 +150,12 @@ export default function EditorPage() {
   const update = (patch) => {
     setDoc((d) => ({ ...d, ...patch }))
     setDirty(true)
+    editSeqRef.current += 1
   }
 
   const save = useCallback(async () => {
+    // Snapshot at click time: the response can confirm only this snapshot.
+    const seqAtSave = editSeqRef.current
     setSaving(true); setError('')
     try {
       const p = await api.saveProject(id, {
@@ -155,14 +163,27 @@ export default function EditorPage() {
         documentVersion: project?.documentVersion,
       })
       setProject(p)
-      setDirty(false)
-      setConflict(false)
-      setMessage('已保存 ' + new Date().toLocaleTimeString())
-      setTimeout(() => setMessage(''), 2500)
+      if (editSeqRef.current === seqAtSave) {
+        // No edits arrived while the request was in flight: the saved
+        // snapshot matches what is on screen, so clear the unsaved state.
+        setDirty(false)
+        setConflict(false)
+        setMessage('已保存 ' + new Date().toLocaleTimeString())
+        setTimeout(() => setMessage(''), 2500)
+      } else {
+        // The user kept editing during the request.  The saved snapshot is
+        // committed (and the version below is now current), but the newer
+        // draft remains unsaved: keep the badge and allow saving again.
+        setDirty(true)
+        setConflict(false)
+        setMessage('已保存点击时的版本；之后又有新的编辑，当前仍为未保存状态')
+        setTimeout(() => setMessage(''), 4000)
+      }
     } catch (e) {
+      // Nothing was written: always keep the draft and the unsaved marker.
+      // On 409, block further saves until an explicit reload (below); other
+      // errors can simply be retried.
       if (e.status === 409) {
-        // Another page saved first: keep the unsaved draft on screen and
-        // block further saves until the user reloads the latest project.
         setConflict(true)
       } else {
         setError(e.message)
@@ -274,6 +295,7 @@ export default function EditorPage() {
       setDoc(p.document)
       setProject(p)
       setDirty(true)
+      editSeqRef.current += 1
     } catch (e) {
       setError(`导入失败：${e.message}`)
     } finally {
@@ -305,7 +327,11 @@ export default function EditorPage() {
           <input
             className="project-name"
             value={name}
-            onChange={(e) => { setName(e.target.value); setDirty(true) }}
+            onChange={(e) => {
+              setName(e.target.value)
+              setDirty(true)
+              editSeqRef.current += 1
+            }}
           />
           {dirty && <span className="badge warn">未保存</span>}
         </div>
